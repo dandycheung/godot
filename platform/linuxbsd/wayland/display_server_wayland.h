@@ -39,13 +39,13 @@
 #include "servers/rendering/rendering_device.h"
 
 #ifdef VULKAN_ENABLED
-#include "wayland/vulkan_context_wayland.h"
+#include "wayland/rendering_context_driver_vulkan_wayland.h"
 #endif
 
 #endif //RD_ENABLED
 
 #ifdef GLES3_ENABLED
-#include "wayland/egl_manager_wayland.h"
+#include "drivers/egl/egl_manager.h"
 #endif
 
 #if defined(SPEECHD_ENABLED)
@@ -59,8 +59,6 @@
 
 #include "core/config/project_settings.h"
 #include "core/input/input.h"
-#include "scene/resources/atlas_texture.h"
-#include "scene/resources/texture.h"
 #include "servers/display_server.h"
 
 #include <limits.h>
@@ -107,6 +105,12 @@ class DisplayServerWayland : public DisplayServer {
 		Point2i hotspot;
 	};
 
+	enum class SuspendState {
+		NONE, // Unsuspended.
+		TIMEOUT, // Legacy fallback.
+		CAPABILITY, // New "suspended" wm_capability flag.
+	};
+
 	CursorShape cursor_shape = CURSOR_ARROW;
 	DisplayServer::MouseMode mouse_mode = DisplayServer::MOUSE_MODE_VISIBLE;
 
@@ -117,23 +121,27 @@ class DisplayServerWayland : public DisplayServer {
 
 	Context context;
 
-	bool frame = false;
+	String ime_text;
+	Vector2i ime_selection;
+
+	SuspendState suspend_state = SuspendState::NONE;
 	bool emulate_vsync = false;
 
 	String rendering_driver;
 
 #ifdef RD_ENABLED
-	ApiContextRD *context_rd = nullptr;
+	RenderingContextDriver *rendering_context = nullptr;
 	RenderingDevice *rendering_device = nullptr;
 #endif
 
 #ifdef GLES3_ENABLED
-	EGLManagerWayland *egl_manager = nullptr;
+	EGLManager *egl_manager = nullptr;
 #endif
 
 #ifdef SPEECHD_ENABLED
 	TTS_Linux *tts = nullptr;
 #endif
+	NativeMenu *native_menu = nullptr;
 
 #if DBUS_ENABLED
 	FreeDesktopPortalDesktop *portal_desktop = nullptr;
@@ -151,6 +159,8 @@ class DisplayServerWayland : public DisplayServer {
 	void _resize_window(const Size2i &p_size);
 
 	virtual void _show_window();
+
+	void try_suspend();
 
 public:
 	virtual bool has_feature(Feature p_feature) const override;
@@ -171,10 +181,13 @@ public:
 #ifdef DBUS_ENABLED
 	virtual bool is_dark_mode_supported() const override;
 	virtual bool is_dark_mode() const override;
+	virtual void set_system_theme_change_callback(const Callable &p_callable) override;
 
 	virtual Error file_dialog_show(const String &p_title, const String &p_current_directory, const String &p_filename, bool p_show_hidden, FileDialogMode p_mode, const Vector<String> &p_filters, const Callable &p_callback) override;
 	virtual Error file_dialog_with_options_show(const String &p_title, const String &p_current_directory, const String &p_root, const String &p_filename, bool p_show_hidden, FileDialogMode p_mode, const Vector<String> &p_filters, const TypedArray<Dictionary> &p_options, const Callable &p_callback) override;
 #endif
+
+	virtual void beep() const override;
 
 	virtual void mouse_set_mode(MouseMode p_mode) override;
 	virtual MouseMode mouse_get_mode() const override;
@@ -259,8 +272,14 @@ public:
 	virtual void window_set_ime_active(const bool p_active, WindowID p_window_id = MAIN_WINDOW_ID) override;
 	virtual void window_set_ime_position(const Point2i &p_pos, WindowID p_window_id = MAIN_WINDOW_ID) override;
 
+	virtual Point2i ime_get_selection() const override;
+	virtual String ime_get_text() const override;
+
 	virtual void window_set_vsync_mode(DisplayServer::VSyncMode p_vsync_mode, WindowID p_window_id = MAIN_WINDOW_ID) override;
 	virtual DisplayServer::VSyncMode window_get_vsync_mode(WindowID p_window_id) const override;
+
+	virtual void window_start_drag(WindowID p_window = MAIN_WINDOW_ID) override;
+	virtual void window_start_resize(WindowResizeEdge p_edge, WindowID p_window) override;
 
 	virtual void cursor_set_shape(CursorShape p_shape) override;
 	virtual CursorShape cursor_get_shape() const override;
@@ -276,17 +295,18 @@ public:
 	virtual void process_events() override;
 
 	virtual void release_rendering_thread() override;
-	virtual void make_rendering_thread() override;
 	virtual void swap_buffers() override;
 
 	virtual void set_context(Context p_context) override;
 
-	static DisplayServer *create_func(const String &p_rendering_driver, WindowMode p_mode, VSyncMode p_vsync_mode, uint32_t p_flags, const Point2i *p_position, const Size2i &p_resolution, int p_screen, Error &r_error);
+	virtual bool is_window_transparency_available() const override;
+
+	static DisplayServer *create_func(const String &p_rendering_driver, WindowMode p_mode, VSyncMode p_vsync_mode, uint32_t p_flags, const Point2i *p_position, const Size2i &p_resolution, int p_screen, Context p_context, int64_t p_parent_window, Error &r_error);
 	static Vector<String> get_rendering_drivers_func();
 
 	static void register_wayland_driver();
 
-	DisplayServerWayland(const String &p_rendering_driver, WindowMode p_mode, VSyncMode p_vsync_mode, uint32_t p_flags, const Vector2i &p_resolution, Error &r_error);
+	DisplayServerWayland(const String &p_rendering_driver, WindowMode p_mode, VSyncMode p_vsync_mode, uint32_t p_flags, const Vector2i &p_resolution, Context p_context, int64_t p_parent_window, Error &r_error);
 	~DisplayServerWayland();
 };
 

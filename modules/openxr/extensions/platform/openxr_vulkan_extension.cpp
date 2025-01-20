@@ -38,14 +38,6 @@
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering_server.h"
 
-OpenXRVulkanExtension::OpenXRVulkanExtension() {
-	VulkanContext::set_vulkan_hooks(this);
-}
-
-OpenXRVulkanExtension::~OpenXRVulkanExtension() {
-	VulkanContext::set_vulkan_hooks(nullptr);
-}
-
 HashMap<String, bool *> OpenXRVulkanExtension::get_requested_extensions() {
 	HashMap<String, bool *> request_extensions;
 
@@ -178,10 +170,6 @@ bool OpenXRVulkanExtension::get_physical_device(VkPhysicalDevice *r_device) {
 bool OpenXRVulkanExtension::create_vulkan_device(const VkDeviceCreateInfo *p_device_create_info, VkDevice *r_device) {
 	ERR_FAIL_NULL_V(OpenXRAPI::get_singleton(), false);
 
-	// the first entry in our queue list should be the one we need to remember...
-	vulkan_queue_family_index = p_device_create_info->pQueueCreateInfos[0].queueFamilyIndex;
-	vulkan_queue_index = 0; // ??
-
 	XrVulkanDeviceCreateInfoKHR create_info = {
 		XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR, // type
 		nullptr, // next
@@ -209,9 +197,17 @@ bool OpenXRVulkanExtension::create_vulkan_device(const VkDeviceCreateInfo *p_dev
 	return true;
 }
 
+void OpenXRVulkanExtension::set_direct_queue_family_and_index(uint32_t p_queue_family_index, uint32_t p_queue_index) {
+	vulkan_queue_family_index = p_queue_family_index;
+	vulkan_queue_index = p_queue_index;
+}
+
 XrGraphicsBindingVulkanKHR OpenXRVulkanExtension::graphics_binding_vulkan;
 
 void *OpenXRVulkanExtension::set_session_create_and_get_next_pointer(void *p_next_pointer) {
+	DEV_ASSERT(vulkan_queue_family_index < UINT32_MAX && "Direct queue family index was not specified yet.");
+	DEV_ASSERT(vulkan_queue_index < UINT32_MAX && "Direct queue index was not specified yet.");
+
 	graphics_binding_vulkan.type = XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR;
 	graphics_binding_vulkan.next = p_next_pointer;
 	graphics_binding_vulkan.instance = vulkan_instance;
@@ -233,13 +229,17 @@ void OpenXRVulkanExtension::get_usable_swapchain_formats(Vector<int64_t> &p_usab
 }
 
 void OpenXRVulkanExtension::get_usable_depth_formats(Vector<int64_t> &p_usable_swap_chains) {
+	// Note, it is very likely we do NOT support any of depth formats where we can combine our stencil support (e.g. _S8_UINT).
+	// Right now this isn't a problem but once stencil support becomes an issue, we need to check for this in the rendering engine
+	// and create a separate buffer for the stencil.
+
 	p_usable_swap_chains.push_back(VK_FORMAT_D24_UNORM_S8_UINT);
 	p_usable_swap_chains.push_back(VK_FORMAT_D32_SFLOAT_S8_UINT);
 	p_usable_swap_chains.push_back(VK_FORMAT_D32_SFLOAT);
 }
 
 bool OpenXRVulkanExtension::get_swapchain_image_data(XrSwapchain p_swapchain, int64_t p_swapchain_format, uint32_t p_width, uint32_t p_height, uint32_t p_sample_count, uint32_t p_array_size, void **r_swapchain_graphics_data) {
-	XrSwapchainImageVulkanKHR *images = nullptr;
+	LocalVector<XrSwapchainImageVulkanKHR> images;
 
 	RenderingServer *rendering_server = RenderingServer::get_singleton();
 	ERR_FAIL_NULL_V(rendering_server, false);
@@ -253,27 +253,23 @@ bool OpenXRVulkanExtension::get_swapchain_image_data(XrSwapchain p_swapchain, in
 		return false;
 	}
 
-	images = (XrSwapchainImageVulkanKHR *)memalloc(sizeof(XrSwapchainImageVulkanKHR) * swapchain_length);
-	ERR_FAIL_NULL_V_MSG(images, false, "OpenXR Couldn't allocate memory for swap chain image");
+	images.resize(swapchain_length);
 
-	for (uint64_t i = 0; i < swapchain_length; i++) {
-		images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
-		images[i].next = nullptr;
-		images[i].image = VK_NULL_HANDLE;
+	for (XrSwapchainImageVulkanKHR &image : images) {
+		image.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+		image.next = nullptr;
+		image.image = VK_NULL_HANDLE;
 	}
 
-	result = xrEnumerateSwapchainImages(p_swapchain, swapchain_length, &swapchain_length, (XrSwapchainImageBaseHeader *)images);
+	result = xrEnumerateSwapchainImages(p_swapchain, swapchain_length, &swapchain_length, (XrSwapchainImageBaseHeader *)images.ptr());
 	if (XR_FAILED(result)) {
 		print_line("OpenXR: Failed to get swapchaim images [", OpenXRAPI::get_singleton()->get_error_string(result), "]");
-		memfree(images);
 		return false;
 	}
 
-	// SwapchainGraphicsData *data = (SwapchainGraphicsData *)memalloc(sizeof(SwapchainGraphicsData));
 	SwapchainGraphicsData *data = memnew(SwapchainGraphicsData);
 	if (data == nullptr) {
 		print_line("OpenXR: Failed to allocate memory for swapchain data");
-		memfree(images);
 		return false;
 	}
 	*r_swapchain_graphics_data = data;
@@ -291,12 +287,12 @@ bool OpenXRVulkanExtension::get_swapchain_image_data(XrSwapchain p_swapchain, in
 			// This also means we're reading the values as is for our preview on screen.
 			// The OpenXR runtime however is still treating this as an sRGB format and
 			// will thus do an sRGB -> Linear conversion as expected.
-			// format = RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB;
+			//format = RenderingDevice::DATA_FORMAT_R8G8B8A8_SRGB;
 			format = RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM;
 			usage_flags |= RenderingDevice::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT;
 			break;
 		case VK_FORMAT_B8G8R8A8_SRGB:
-			// format = RenderingDevice::DATA_FORMAT_B8G8R8A8_SRGB;
+			//format = RenderingDevice::DATA_FORMAT_B8G8R8A8_SRGB;
 			format = RenderingDevice::DATA_FORMAT_B8G8R8A8_UNORM;
 			usage_flags |= RenderingDevice::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT;
 			break;
@@ -322,7 +318,7 @@ bool OpenXRVulkanExtension::get_swapchain_image_data(XrSwapchain p_swapchain, in
 			break;
 		default:
 			// continue with our default value
-			print_line("Unsupported swapchain format ", p_swapchain_format);
+			print_line("OpenXR: Unsupported swapchain format", p_swapchain_format);
 			break;
 	}
 
@@ -350,20 +346,20 @@ bool OpenXRVulkanExtension::get_swapchain_image_data(XrSwapchain p_swapchain, in
 			break;
 		default:
 			// continue with our default value
-			print_line("Unsupported sample count ", p_sample_count);
+			print_line("OpenXR: Unsupported sample count", p_sample_count);
 			break;
 	}
 
 	Vector<RID> texture_rids;
 
 	// create Godot texture objects for each entry in our swapchain
-	for (uint64_t i = 0; i < swapchain_length; i++) {
+	for (const XrSwapchainImageVulkanKHR &swapchain_image : images) {
 		RID image_rid = rendering_device->texture_create_from_extension(
 				p_array_size == 1 ? RenderingDevice::TEXTURE_TYPE_2D : RenderingDevice::TEXTURE_TYPE_2D_ARRAY,
 				format,
 				samples,
 				usage_flags,
-				(uint64_t)images[i].image,
+				(uint64_t)swapchain_image.image,
 				p_width,
 				p_height,
 				1,
@@ -374,13 +370,11 @@ bool OpenXRVulkanExtension::get_swapchain_image_data(XrSwapchain p_swapchain, in
 
 	data->texture_rids = texture_rids;
 
-	memfree(images);
-
 	return true;
 }
 
 bool OpenXRVulkanExtension::create_projection_fov(const XrFovf p_fov, double p_z_near, double p_z_far, Projection &r_camera_matrix) {
-	// Even though this is a Vulkan renderer we're using OpenGL coordinate systems
+	// Even though this is a Vulkan renderer we're using OpenGL coordinate systems.
 	OpenXRUtil::XrMatrix4x4f matrix;
 	OpenXRUtil::XrMatrix4x4f_CreateProjectionFov(&matrix, OpenXRUtil::GRAPHICS_OPENGL, p_fov, (float)p_z_near, (float)p_z_far);
 
@@ -413,9 +407,9 @@ void OpenXRVulkanExtension::cleanup_swapchain_graphics_data(void **p_swapchain_g
 	RenderingDevice *rendering_device = rendering_server->get_rendering_device();
 	ERR_FAIL_NULL(rendering_device);
 
-	for (int i = 0; i < data->texture_rids.size(); i++) {
-		// This should clean up our RIDs and associated texture objects but shouldn't destroy the images, they are owned by our XrSwapchain
-		rendering_device->free(data->texture_rids[i]);
+	for (const RID &texture_rid : data->texture_rids) {
+		// This should clean up our RIDs and associated texture objects but shouldn't destroy the images, they are owned by our XrSwapchain.
+		rendering_device->free(texture_rid);
 	}
 	data->texture_rids.clear();
 
